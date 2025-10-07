@@ -1,0 +1,35 @@
+{
+    "name": "apx-repack",
+    "version": "1.0.0",
+    "description": "CLI to repack telemetry/datalink XML into APXTLM",
+    "license": "ISC",
+    "private": true,
+    "type": "commonjs",
+    "main": "dist/index.js",
+    "bin": {
+        "apx-repack": "dist/index.js"
+    },
+    "scripts": {
+        "build:ts": "tsc -p .",
+        "build:bundle": "ncc build src/index.ts -o dist",
+        "build:bin": "npm run build:bundle && pkg -t node18-linux-x64 dist/index.js -o apx-repack",
+        "start": "node dist/index.js",
+        "lint": "tsc --noEmit"
+    },
+    "dependencies": {
+        "fast-xml-parser": "^5.2.5",
+        "sax": "^1.4.1"
+    },
+    "devDependencies": {
+        "@types/node": "^22.7.5",
+        "@types/sax": "^1.2.7",
+        "@vercel/ncc": "^0.38.4",
+        "pkg": "^5.8.1",
+        "typescript": "^5.5.4"
+    },
+    "pkg": {
+        "targets": [
+            "node18-linux-x64"
+        ]
+    }
+}
