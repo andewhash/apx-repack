@@ -5,19 +5,19 @@ import { XMLParser } from "fast-xml-parser";
 import { ApxTlmWriter } from "./apxtlm-writer.service";
 
 const MAX_FIELDS = 2048;
-const TELEMETRY_TAGS = new Set(["S", "D"]);      
-const EVENT_TAGS     = new Set(["event", "evt"]); 
-const SKIP_TOP_LEVEL = new Set(["S", "D", "event", "evt", "#text", "@_"]); 
+const TELEMETRY_TAGS = new Set(["S", "D"]);
+const EVENT_TAGS = new Set(["event", "evt"]);
+const SKIP_TOP_LEVEL = new Set(["S", "D", "event", "evt", "#text", "@_"]);
 
 type Ctx = {
   writer?: ApxTlmWriter;
   wroteHeader: boolean;
   utcOffset: number;
-  baseTs: number;            
+  baseTs: number;
   fields: string[];
   fieldsDeclared: boolean;
 
-  stack: string[];          
+  stack: string[];
   inCsv: boolean;
   csvTag: string;
   csvAttrs: Record<string, string>;
@@ -31,6 +31,7 @@ type Ctx = {
   capJsoDepth: number;
   capJsoName: string;
   capXml: string[];
+  logFile?: fs.WriteStream;
 };
 
 function declareFieldsIfNeeded(ctx: Ctx, tokenCountHint?: number) {
@@ -39,11 +40,14 @@ function declareFieldsIfNeeded(ctx: Ctx, tokenCountHint?: number) {
 
   if (!ctx.fields.length) {
     const n = Math.min(tokenCountHint ?? 0, MAX_FIELDS);
-    ctx.fields = Array.from({ length: n }, (_, i) => `.#${i}`.slice(1));
+    ctx.fields = Array.from({ length: n }, (_, i) => `.#${i}`.slice(1)); 
   }
 
   if (ctx.fields.length > MAX_FIELDS) ctx.fields.length = MAX_FIELDS;
-  for (const f of ctx.fields) ctx.writer.emitField(f, []);
+
+  for (const f of ctx.fields) {
+    ctx.writer.emitField(f, []);
+  }
   ctx.fieldsDeclared = true;
 }
 
@@ -64,8 +68,16 @@ function openTagToString(name: string, attrs: Record<string, any>): string {
   const a = Object.entries(attrs ?? {}).map(([k, v]) => `${k}="${String(v)}"`).join(" ");
   return a.length ? `<${name} ${a}>` : `<${name}>`;
 }
+
 function closeTagToString(name: string): string {
   return `</${name}>`;
+}
+
+function logToFile(ctx: Ctx, message: string) {
+  if (!ctx.logFile) {
+    ctx.logFile = fs.createWriteStream(path.resolve(__dirname, 'log.txt'), { flags: 'a' });
+  }
+  ctx.logFile.write(`[${new Date().toISOString()}] ${message}\n`);
 }
 
 export async function repackDatalinkToApx_stream(
@@ -96,30 +108,63 @@ export async function repackDatalinkToApx_stream(
     capJsoDepth: 0,
     capJsoName: "",
     capXml: [],
+    logFile: undefined,
   };
 
   const parser = sax.createStream(true, { trim: false, normalize: false });
 
-  // -------- open tag ----------
   parser.on("opentag", (tag) => {
     const name = tag.name;
     const attrs = tag.attributes as Record<string, any>;
+
     ctx.stack.push(name);
 
     if (ctx.stack.length === 1) {
       const t = attrs?.["time_ms"] ?? attrs?.["UTC"];
       if (t != null) {
         const n = Number(t);
-        if (Number.isFinite(n)) ctx.baseTs = n >>> 0;
+        if (Number.isFinite(n)) {
+          ctx.baseTs = n >>> 0;
+        } else {
+          logToFile(ctx, `Invalid timestamp detected, setting default: ${t}`);
+          ctx.baseTs = 0;
+        }
       }
+
       if (!ctx.writer) {
         ctx.writer = new ApxTlmWriter(0x0100, ctx.utcOffset, ctx.baseTs >>> 0, outFile);
         ctx.writer.writeHeaderPlaceholder();
         ctx.wroteHeader = true;
+
+        const timestamp = new Date(ctx.baseTs);
+        const utcOffsetInMinutes = ctx.utcOffset / 60;
+        
+        const info = {
+          conf: "Borey-801",
+          host: {
+            hostname: "Ovsannikovs-MacBook-Pro",
+            uid: "86C97FFC9CD3544D0D7B61F984B621B48430910F",
+            username: "nikolay"
+          },
+          sw: {
+            hash: "fe7bd27c",
+            version: "11.2.12"
+          },
+          title: "250910_1730_32396E3-BOREY",
+          unit: {
+            name: "BOREY",
+            time: timestamp.getTime(),
+            type: "UAV",
+            uid: "230047000F51323032343731"
+          },
+          timestamp: timestamp.getTime(), // Unix timestamp в миллисекундах
+          utc_offset: utcOffsetInMinutes,  // Смещение в минутах
+        };
+
+        ctx.writer.emitInfo(info);
       }
     }
 
-    // CSV
     if (TELEMETRY_TAGS.has(name)) {
       ctx.inCsv = true;
       ctx.csvTag = name;
@@ -128,7 +173,6 @@ export async function repackDatalinkToApx_stream(
       return;
     }
 
-    // event
     if (EVENT_TAGS.has(name)) {
       ctx.inEvt = true;
       ctx.evtName = (attrs?.["name"] as string) ?? name;
@@ -139,7 +183,7 @@ export async function repackDatalinkToApx_stream(
 
     if (includeJso && ctx.stack.length === 2 && !SKIP_TOP_LEVEL.has(name)) {
       ctx.capJsoActive = true;
-      ctx.capJsoDepth = ctx.stack.length; // 2
+      ctx.capJsoDepth = ctx.stack.length;
       ctx.capJsoName = name;
       ctx.capXml = [];
       ctx.capXml.push(openTagToString(name, attrs));
@@ -151,18 +195,11 @@ export async function repackDatalinkToApx_stream(
     }
   });
 
-  // -------- text ----------
   parser.on("text", (txt) => {
-    // mandala.fields
-    if (ctx.stack.length >= 2 &&
-        ctx.stack[ctx.stack.length - 1] === "fields" &&
-        ctx.stack.includes("mandala")) {
+    if (ctx.stack.length >= 2 && ctx.stack[ctx.stack.length - 1] === "fields" && ctx.stack.includes("mandala")) {
       const raw = (txt ?? "").trim();
       if (raw) {
-        ctx.fields = raw
-          .split(/[,\s;]+/)
-          .map(s => s.trim())
-          .filter(Boolean);
+        ctx.fields = raw.split(/[,\s;]+/).map(s => s.trim()).filter(Boolean);
       }
     }
 
@@ -174,15 +211,11 @@ export async function repackDatalinkToApx_stream(
     }
   });
 
-  // -------- close tag ----------
   parser.on("closetag", (name) => {
-    // CSV
     if (ctx.inCsv && name === ctx.csvTag) {
       ctx.inCsv = false;
-
       const tsAttr = ctx.csvAttrs["t"] ?? ctx.csvAttrs["ts"] ?? ctx.csvAttrs["time_ms"] ?? ctx.csvAttrs["UTC"];
       const ts = tsAttr != null ? Number(tsAttr) : 0;
-
       const parts = splitTokensLoose(ctx.csvText);
       declareFieldsIfNeeded(ctx, parts.length);
 
@@ -203,7 +236,6 @@ export async function repackDatalinkToApx_stream(
       }
     }
 
-    // EVT
     if (ctx.inEvt && EVENT_TAGS.has(name)) {
       ctx.inEvt = false;
       const wr = ctx.writer!;
@@ -243,7 +275,7 @@ export async function repackDatalinkToApx_stream(
           const val = (obj as any)[ctx.capJsoName] ?? obj;
           ctx.writer!.emitJso(ctx.capJsoName, val, ctx.baseTs >>> 0);
         } catch (e: any) {
-          console.warn(`[repack][warn] JSO parse failed <${ctx.capJsoName}>: ${e?.message ?? e}`);
+          logToFile(ctx, `[repack][warn] JSO parse failed <${ctx.capJsoName}>: ${e?.message ?? e}`);
         }
 
         ctx.capJsoActive = false;
@@ -274,6 +306,6 @@ export async function repackDatalinkToApx_stream(
 
   try {
     const sz = fs.statSync(outFile).size;
-    console.log(`[repack] DONE → ${path.resolve(outFile)} size=${sz} bytes`);
+    logToFile(ctx, `[repack] DONE → ${path.resolve(outFile)} size=${sz} bytes`);
   } catch {}
 }

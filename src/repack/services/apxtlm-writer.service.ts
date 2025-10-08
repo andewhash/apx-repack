@@ -8,6 +8,7 @@ export enum ExtId { stop=0, ts=1, dir=2, field=3, evtid=4, evt=8, jso=9, raw=10,
 function cstr(s: string): Buffer {
   return Buffer.concat([Buffer.from(s,'utf8'), Buffer.from([0x00])]);
 }
+
 function dspecByte(dspec: DSpec, vidx: number): [number, number] {
   const low3 = vidx & 0x07;
   const hi   = (vidx >> 3) & 0xFF;
@@ -15,6 +16,7 @@ function dspecByte(dspec: DSpec, vidx: number): [number, number] {
   const b1   = hi;
   return [b0, b1];
 }
+
 function qCompress(payload: Buffer): Buffer {
   const comp = zlib.deflateSync(payload);
   const out = Buffer.allocUnsafe(4 + comp.length);
@@ -53,13 +55,24 @@ export class ApxTlmWriter {
   writeHeaderPlaceholder() {
     if (this.headerWritten) return;
     const b = Buffer.alloc(44, 0);
-    b.write("APXTLM", 0, "ascii");
-    b.writeUInt16LE(this.version, 16);
-    b.writeUInt16LE(44, 18);
-    b.writeBigUInt64LE(BigInt(this.startTimestampMs64 >>> 0), 32);
-    b.writeInt32LE(this.utcOffset | 0, 40);
+    b.write("APXTLM", 0, "ascii"); // magic
+    b.writeUInt16LE(1, 16); // версия файла 1
+    b.writeUInt16LE(44, 18); // payload_offset
+    b.writeBigUInt64LE(BigInt(this.startTimestampMs64 >>> 0), 32); // timestamp
+    b.writeInt32LE(this.utcOffset | 0, 40); // utc_offset
     this.write(b);
     this.headerWritten = true;
+  }
+
+  // Now, let's handle the `info` section.
+  emitInfo(info: any) {
+    this.pushExt(ExtId.jso);
+    const nameLit = this.cachedLit("info");
+    const payload = Buffer.from(JSON.stringify(info), "utf8");
+    const q = qCompress(payload);
+    const sz = Buffer.allocUnsafe(4);
+    sz.writeUInt32LE(q.length, 0);
+    this.write(Buffer.concat([nameLit, sz, q]));
   }
 
   emitField(name: string, info: string[] = []) {
@@ -101,6 +114,7 @@ export class ApxTlmWriter {
   private cachedLit(s: string): Buffer {
     return Buffer.concat([ Buffer.from([0xFF]), cstr(s) ]);
   }
+
   emitEvt(evIndex: number, values: string[]) {
     this.pushExt(ExtId.evt);
     const parts: Buffer[] = [ Buffer.from([evIndex & 0xFF]) ];
