@@ -4,6 +4,7 @@ import sax from "sax";
 import { XMLParser } from "fast-xml-parser";
 import { ApxTlmWriter } from "./apxtlm-writer.service";
 import { buildInfoForInput } from "./info.util";
+import { createHash } from "crypto";
 
 const MAX_FIELDS = 2048;
 const TELEMETRY_TAGS = new Set(["S", "D"]);
@@ -25,6 +26,86 @@ function normalizeEpochMs(n: number, inputFile: string): number {
   if (v < EPOCH_2000_MS) return fileMtimeMs(inputFile);
   return v;
 }
+
+
+
+/** нормализация «сырого» узлового дампа в формат Ground */
+function tryNormalizeNodes(raw: any, baseTs: number) {
+  // поддерживаем два варианта обёртки:
+  // 1) весь объект с полями ident/node/...
+  // 2) объект сразу с node/ident (иногда попадает так)
+  const hasIdent = raw && typeof raw === "object" && (raw.ident || raw.identity);
+  const nodeObj  = raw?.node;
+  if (!hasIdent || !nodeObj) return null;
+
+  const ident = raw.ident || raw.identity || {};
+  const uid   = String(ident.uid ?? "").trim();
+  const name  = String(ident.callsign ?? ident.name ?? "NODE").trim();
+  const type  = String(ident.class ?? ident.type ?? "UAV").trim();
+
+  const ninfo = nodeObj.info || {};
+  const version  = ninfo.version;
+  const hardware = ninfo.hardware;
+
+  // собрать список полей
+  let fields = nodeObj.fields?.field;
+  if (!fields) return null;
+  if (!Array.isArray(fields)) fields = [fields];
+
+  const dictFields: Array<{name:string; title:string; type:string}> = [];
+  const values: Record<string, any> = {};
+
+  let autoIdx = 0;
+  for (const f of fields) {
+    // возможные места имени
+    const nameRaw = f?.name ?? f?.["@_name"] ?? f?.id ?? null;
+    const name = nameRaw ? String(nameRaw) : `f${autoIdx++}`;
+    const title = f?.title ?? name;
+
+    // тип в struct.type (или просто type)
+    const type = (f?.struct?.type ?? f?.type ?? "string").toString();
+
+    // значение — в .value (строка); конвертировать по типу
+    let v: any = f?.value;
+    if (v !== undefined && v !== null) {
+      const s = String(v).trim();
+      if (type === "int" || type === "i32" || type === "i16" || type === "u32" || type === "u16") {
+        const n = Number(s);
+        v = Number.isFinite(n) ? n : 0;
+      } else if (type === "float" || type === "f32" || type === "double" || type === "f64") {
+        const n = Number(s);
+        v = Number.isFinite(n) ? n : 0;
+      } else if (type === "bool" || type === "boolean") {
+        v = /^(1|true|yes|on)$/i.test(s);
+      } else {
+        v = s;
+      }
+      values[name] = v;
+    }
+
+    dictFields.push({ name, title: String(title), type: String(type) });
+  }
+
+  // cache как первые 8 hex от sha1(dictFields)
+  const h = createHash("sha1");
+  h.update(JSON.stringify(dictFields));
+  const cache = h.digest("hex").slice(0, 8).toUpperCase();
+
+  const node = {
+    info: {
+      uid, name, type,
+      time: baseTs >>> 0,
+      ...(version ? { version } : {}),
+      ...(hardware ? { hardware } : {}),
+    },
+    dict: { cache, fields: dictFields },
+    values,
+    time: baseTs >>> 0,
+  };
+
+  return { nodes: [node] };
+}
+
 
 type Ctx = {
   writer?: ApxTlmWriter;
@@ -253,7 +334,12 @@ export async function repackDatalinkToApx_stream(
           });
           const obj = parser.parse(xmlStr);
           const val = (obj as any)[ctx.capJsoName] ?? obj;
-          ctx.writer!.emitJso(ctx.capJsoName, val, ctx.baseTs >>> 0);
+          const normalized = tryNormalizeNodes(val, ctx.baseTs);
+          if (normalized) {
+            ctx.writer!.emitJso("nodes", normalized); // без TS
+          } else {
+            ctx.writer!.emitJso(ctx.capJsoName, val); // обычный путь
+          }
         } catch (e: any) {
           logToFile(ctx, `[repack][warn] JSO parse failed <${ctx.capJsoName}>: ${e?.message ?? e}`);
         }
