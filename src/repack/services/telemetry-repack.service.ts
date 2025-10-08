@@ -3,8 +3,14 @@ import * as path from "path";
 import sax from "sax";
 import { XMLParser } from "fast-xml-parser";
 import { ApxTlmWriter } from "./apxtlm-writer.service";
+import { buildInfoForInput } from "./info.util";
 
 const MAX_FIELDS = 2048;
+const EPOCH_2000_MS = Date.UTC(2000, 0, 1);
+
+function fileMtimeMs(p: string): number {
+  try { return Math.floor(fs.statSync(p).mtimeMs); } catch { return Date.now(); }
+}
 
 type Ctx = {
   inTelemetry: boolean;
@@ -21,8 +27,8 @@ type Ctx = {
   evtIndex: Map<string, number>;
   writer?: ApxTlmWriter;
   wroteHeader: boolean;
-  baseTs: number;
-  utcOffset: number;
+  baseTs: number;         // ms epoch
+  utcOffsetSec: number;   // seconds
   inDataDepth: number;
   capJsoActive: boolean;
   capJsoDepth: number;
@@ -67,9 +73,7 @@ function openTagToString(name: string, attrs: Record<string, any>): string {
   const a = Object.entries(attrs ?? {}).map(([k, v]) => `${k}="${String(v)}"`).join(" ");
   return a.length ? `<${name} ${a}>` : `<${name}>`;
 }
-function closeTagToString(name: string): string {
-  return `</${name}>`;
-}
+function closeTagToString(name: string): string { return `</${name}>`; }
 
 export async function repackTelemetryToApx_stream(
   inputFile: string,
@@ -77,6 +81,7 @@ export async function repackTelemetryToApx_stream(
   opts: { utcOffset?: number; includeJso?: boolean } = {}
 ): Promise<void> {
   const { utcOffset = 0, includeJso = true } = opts;
+  const utcOffsetSec = utcOffset | 0;
 
   const ctx: Ctx = {
     inTelemetry: false,
@@ -94,7 +99,7 @@ export async function repackTelemetryToApx_stream(
     writer: undefined,
     wroteHeader: false,
     baseTs: 0,
-    utcOffset,
+    utcOffsetSec,
     inDataDepth: 0,
     capJsoActive: false,
     capJsoDepth: 0,
@@ -114,7 +119,6 @@ export async function repackTelemetryToApx_stream(
       ctx.inTelemetry = true;
       return;
     }
-
     if (!ctx.inTelemetry) return;
 
     if (name === "fields") {
@@ -125,22 +129,27 @@ export async function repackTelemetryToApx_stream(
     if (name === "info") {
       if (attrs && attrs["time"] != null) {
         const t = Number(attrs["time"]);
-        if (Number.isFinite(t)) ctx.baseTs = t >>> 0;
+        if (Number.isFinite(t)) ctx.baseTs = Math.floor(t);
       }
     }
 
     if (name === "timestamp" && attrs && attrs["value"]) {
       const t = Date.parse(String(attrs["value"]));
-      if (Number.isFinite(t)) ctx.baseTs = t >>> 0;
+      if (Number.isFinite(t)) ctx.baseTs = Math.floor(t);
     }
 
     if (name === "data") {
       ctx.inData = true;
       ctx.inDataDepth = 1;
 
+      // нормализуем baseTs или берём mtime файла
+      if (!(ctx.baseTs >= EPOCH_2000_MS)) ctx.baseTs = fileMtimeMs(inputFile);
+
       if (!ctx.wroteHeader) {
-        ctx.writer = new ApxTlmWriter(0x0100, ctx.utcOffset, ctx.baseTs >>> 0, outFile);
+        ctx.writer = new ApxTlmWriter(1, ctx.utcOffsetSec, ctx.baseTs, outFile);
         ctx.writer.writeHeaderPlaceholder();
+        // info самым первым
+        ctx.writer.emitInfo(buildInfoForInput(inputFile, "telemetry", ctx.baseTs, {}, ctx.utcOffsetSec));
         ctx.wroteHeader = true;
       }
       return;
@@ -165,7 +174,7 @@ export async function repackTelemetryToApx_stream(
     if (includeJso && !jsoSkip.has(name)) {
       if (!ctx.capJsoActive) {
         ctx.capJsoActive = true;
-        ctx.capJsoDepth = ctx.inDataDepth + 1; 
+        ctx.capJsoDepth = ctx.inDataDepth + 1;
         ctx.capJsoName = name;
         ctx.capXml = [];
       }
@@ -179,13 +188,10 @@ export async function repackTelemetryToApx_stream(
   parser.on("text", (txt) => {
     if (ctx.inFields) {
       const raw = (txt ?? "").trim();
-      if (raw) {
-        ctx.fields = raw.split(",").map(s => s.trim()).filter(Boolean);
-      }
+      if (raw) ctx.fields = raw.split(",").map(s => s.trim()).filter(Boolean);
     }
     if (ctx.inD) ctx.currentD_text += txt;
     if (ctx.inE) ctx.currentE_text += txt;
-
     if (ctx.capJsoActive && txt) ctx.capXml.push(txt);
   });
 
@@ -206,16 +212,11 @@ export async function repackTelemetryToApx_stream(
 
       const parts = parseCsvKeepEmpty(ctx.currentD_text);
       const lim = Math.min(parts.length, ctx.fields.length || MAX_FIELDS);
-      let any = false;
       for (let i = 0; i < lim; i++) {
         const s = parts[i];
-        if (s !== "") {
-          const n = Number(s);
-          if (Number.isFinite(n)) { wr.emitValueF32(i, n); any = true; }
-        }
-      }
-      if (!any && (ctx.fields.length || MAX_FIELDS) > 0) {
-        ctx.writer!.emitValueF32(0, Number.NaN);
+        if (s === "") continue;
+        const n = Number(s);
+        if (Number.isFinite(n)) wr.emitNumber(i, n, false);
       }
       return;
     }
@@ -235,10 +236,7 @@ export async function repackTelemetryToApx_stream(
       wr.emitTs(ts >>> 0);
       const idx = ctx.evtIndex.get(evName)!;
       const vals: string[] = [];
-      for (const k of keys) {
-        if (k === "text") vals.push(ctx.currentE_text.trim());
-        else vals.push(String(a[k] ?? ""));
-      }
+      for (const k of keys) vals.push(k === "text" ? ctx.currentE_text.trim() : String(a[k] ?? ""));
       wr.emitEvt(idx, vals);
       return;
     }
@@ -273,16 +271,12 @@ export async function repackTelemetryToApx_stream(
 
     if (ctx.inData) ctx.inDataDepth--;
 
-    if (name.toLowerCase() === "telemetry") {
-      ctx.inTelemetry = false;
-    }
-    if (name === "data") {
-      ctx.inData = false;
-    }
+    if (name.toLowerCase() === "telemetry") ctx.inTelemetry = false;
+    if (name === "data") ctx.inData = false;
   });
 
   // ===== errors / finish =====
-  const stream = fs.createReadStream(inputFile, { encoding: "utf8", highWaterMark: 100*1024 });
+  const stream = fs.createReadStream(inputFile, { encoding: "utf8", highWaterMark: 100 * 1024 });
 
   await new Promise<void>((resolve, reject) => {
     stream.on("error", reject);
@@ -294,8 +288,10 @@ export async function repackTelemetryToApx_stream(
   if (ctx.writer) {
     await ctx.writer.finalizeToFile();
   } else {
-    const wr = new ApxTlmWriter(0x0100, utcOffset, ctx.baseTs >>> 0, outFile);
+    const baseTs = fileMtimeMs(inputFile);
+    const wr = new ApxTlmWriter(1, utcOffsetSec, baseTs, outFile);
     wr.writeHeaderPlaceholder();
+    wr.emitInfo(buildInfoForInput(inputFile, "telemetry", baseTs, {}, utcOffsetSec));
     await wr.finalizeToFile();
   }
 

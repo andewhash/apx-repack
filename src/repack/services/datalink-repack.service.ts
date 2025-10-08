@@ -3,17 +3,34 @@ import * as path from "path";
 import sax from "sax";
 import { XMLParser } from "fast-xml-parser";
 import { ApxTlmWriter } from "./apxtlm-writer.service";
+import { buildInfoForInput } from "./info.util";
 
 const MAX_FIELDS = 2048;
 const TELEMETRY_TAGS = new Set(["S", "D"]);
 const EVENT_TAGS = new Set(["event", "evt"]);
 const SKIP_TOP_LEVEL = new Set(["S", "D", "event", "evt", "#text", "@_"]);
 
+const EPOCH_2000_MS = Date.UTC(2000, 0, 1);
+
+function fileMtimeMs(p: string): number {
+  try { return Math.floor(fs.statSync(p).mtimeMs); } catch { return Date.now(); }
+}
+
+/** normalize potential seconds→ms; reject pre-2000 values (fallback to file mtime) */
+function normalizeEpochMs(n: number, inputFile: string): number {
+  if (!Number.isFinite(n)) return fileMtimeMs(inputFile);
+  let v = n;
+  if (v < 1e12 && v >= 1e9) v = v * 1000; // seconds → ms
+  v = Math.floor(v);
+  if (v < EPOCH_2000_MS) return fileMtimeMs(inputFile);
+  return v;
+}
+
 type Ctx = {
   writer?: ApxTlmWriter;
   wroteHeader: boolean;
-  utcOffset: number;
-  baseTs: number;
+  utcOffsetSec: number;
+  baseTs: number;           // ms
   fields: string[];
   fieldsDeclared: boolean;
 
@@ -22,15 +39,18 @@ type Ctx = {
   csvTag: string;
   csvAttrs: Record<string, string>;
   csvText: string;
+
   inEvt: boolean;
   evtName: string;
   evtAttrs: Record<string, string>;
   evtText: string;
   evtIndex: Map<string, number>;
+
   capJsoActive: boolean;
   capJsoDepth: number;
   capJsoName: string;
   capXml: string[];
+
   logFile?: fs.WriteStream;
 };
 
@@ -40,14 +60,12 @@ function declareFieldsIfNeeded(ctx: Ctx, tokenCountHint?: number) {
 
   if (!ctx.fields.length) {
     const n = Math.min(tokenCountHint ?? 0, MAX_FIELDS);
-    ctx.fields = Array.from({ length: n }, (_, i) => `.#${i}`.slice(1)); 
+    ctx.fields = Array.from({ length: n }, (_, i) => `#${i}`);
   }
 
   if (ctx.fields.length > MAX_FIELDS) ctx.fields.length = MAX_FIELDS;
 
-  for (const f of ctx.fields) {
-    ctx.writer.emitField(f, []);
-  }
+  for (const f of ctx.fields) ctx.writer.emitField(f, []);
   ctx.fieldsDeclared = true;
 }
 
@@ -68,14 +86,11 @@ function openTagToString(name: string, attrs: Record<string, any>): string {
   const a = Object.entries(attrs ?? {}).map(([k, v]) => `${k}="${String(v)}"`).join(" ");
   return a.length ? `<${name} ${a}>` : `<${name}>`;
 }
-
-function closeTagToString(name: string): string {
-  return `</${name}>`;
-}
+function closeTagToString(name: string): string { return `</${name}>`; }
 
 function logToFile(ctx: Ctx, message: string) {
   if (!ctx.logFile) {
-    ctx.logFile = fs.createWriteStream(path.resolve(__dirname, 'log.txt'), { flags: 'a' });
+    ctx.logFile = fs.createWriteStream(path.resolve(__dirname, "log.txt"), { flags: "a" });
   }
   ctx.logFile.write(`[${new Date().toISOString()}] ${message}\n`);
 }
@@ -86,28 +101,33 @@ export async function repackDatalinkToApx_stream(
   opts: { utcOffset?: number; includeJso?: boolean } = {}
 ): Promise<void> {
   const { utcOffset = 0, includeJso = true } = opts;
+  const utcOffsetSec = utcOffset | 0;
 
   const ctx: Ctx = {
     writer: undefined,
     wroteHeader: false,
-    utcOffset,
+    utcOffsetSec,
     baseTs: 0,
     fields: [],
     fieldsDeclared: false,
+
     stack: [],
     inCsv: false,
     csvTag: "",
     csvAttrs: {},
     csvText: "",
+
     inEvt: false,
     evtName: "",
     evtAttrs: {},
     evtText: "",
     evtIndex: new Map(),
+
     capJsoActive: false,
     capJsoDepth: 0,
     capJsoName: "",
     capXml: [],
+
     logFile: undefined,
   };
 
@@ -120,47 +140,21 @@ export async function repackDatalinkToApx_stream(
     ctx.stack.push(name);
 
     if (ctx.stack.length === 1) {
-      const t = attrs?.["time_ms"] ?? attrs?.["UTC"];
-      if (t != null) {
-        const n = Number(t);
-        if (Number.isFinite(n)) {
-          ctx.baseTs = n >>> 0;
-        } else {
-          logToFile(ctx, `Invalid timestamp detected, setting default: ${t}`);
-          ctx.baseTs = 0;
-        }
+      const tRaw = (attrs?.["time_ms"] ?? attrs?.["UTC"]);
+      if (tRaw != null) {
+        const n = Number(tRaw);
+        ctx.baseTs = normalizeEpochMs(n, inputFile);
+      } else {
+        ctx.baseTs = fileMtimeMs(inputFile);
       }
 
       if (!ctx.writer) {
-        ctx.writer = new ApxTlmWriter(0x0100, ctx.utcOffset, ctx.baseTs >>> 0, outFile);
+        ctx.writer = new ApxTlmWriter(1, ctx.utcOffsetSec, ctx.baseTs, outFile);
         ctx.writer.writeHeaderPlaceholder();
         ctx.wroteHeader = true;
 
-        const timestamp = new Date(ctx.baseTs);
-        const utcOffsetInMinutes = ctx.utcOffset / 60;
-        
-        const info = {
-          conf: "Borey-801",
-          host: {
-            hostname: "Ovsannikovs-MacBook-Pro",
-            uid: "86C97FFC9CD3544D0D7B61F984B621B48430910F",
-            username: "nikolay"
-          },
-          sw: {
-            hash: "fe7bd27c",
-            version: "11.2.12"
-          },
-          title: "250910_1730_32396E3-BOREY",
-          unit: {
-            name: "BOREY",
-            time: timestamp.getTime(),
-            type: "UAV",
-            uid: "230047000F51323032343731"
-          },
-          timestamp: timestamp.getTime(), // Unix timestamp в миллисекундах
-          utc_offset: utcOffsetInMinutes,  // Смещение в минутах
-        };
-
+        // info первым блоком
+        const info = buildInfoForInput(inputFile, "datalink", ctx.baseTs, {}, ctx.utcOffsetSec);
         ctx.writer.emitInfo(info);
       }
     }
@@ -190,25 +184,18 @@ export async function repackDatalinkToApx_stream(
       return;
     }
 
-    if (ctx.capJsoActive) {
-      ctx.capXml.push(openTagToString(name, attrs));
-    }
+    if (ctx.capJsoActive) ctx.capXml.push(openTagToString(name, attrs));
   });
 
   parser.on("text", (txt) => {
     if (ctx.stack.length >= 2 && ctx.stack[ctx.stack.length - 1] === "fields" && ctx.stack.includes("mandala")) {
       const raw = (txt ?? "").trim();
-      if (raw) {
-        ctx.fields = raw.split(/[,\s;]+/).map(s => s.trim()).filter(Boolean);
-      }
+      if (raw) ctx.fields = raw.split(/[,\s;]+/).map(s => s.trim()).filter(Boolean);
     }
 
     if (ctx.inCsv) ctx.csvText += txt;
     if (ctx.inEvt) ctx.evtText += txt;
-
-    if (ctx.capJsoActive && txt) {
-      ctx.capXml.push(txt);
-    }
+    if (ctx.capJsoActive && txt) ctx.capXml.push(txt);
   });
 
   parser.on("closetag", (name) => {
@@ -216,6 +203,7 @@ export async function repackDatalinkToApx_stream(
       ctx.inCsv = false;
       const tsAttr = ctx.csvAttrs["t"] ?? ctx.csvAttrs["ts"] ?? ctx.csvAttrs["time_ms"] ?? ctx.csvAttrs["UTC"];
       const ts = tsAttr != null ? Number(tsAttr) : 0;
+
       const parts = splitTokensLoose(ctx.csvText);
       declareFieldsIfNeeded(ctx, parts.length);
 
@@ -223,16 +211,11 @@ export async function repackDatalinkToApx_stream(
       wr.emitTs((Number.isFinite(ts) ? ts : 0) >>> 0);
 
       const lim = Math.min(parts.length, ctx.fields.length || MAX_FIELDS);
-      let any = false;
       for (let i = 0; i < lim; i++) {
         const s = parts[i];
-        if (s !== "") {
-          const n = Number(s);
-          if (Number.isFinite(n)) { wr.emitValueF32(i, n); any = true; }
-        }
-      }
-      if (!any && (ctx.fields.length || MAX_FIELDS) > 0) {
-        wr.emitValueF32(0, Number.NaN);
+        if (s === "") continue;
+        const n = Number(s);
+        if (Number.isFinite(n)) wr.emitNumber(i, n, false);
       }
     }
 
@@ -250,10 +233,7 @@ export async function repackDatalinkToApx_stream(
       wr.emitTs(ts >>> 0);
       const idx = ctx.evtIndex.get(evName)!;
       const vals: string[] = [];
-      for (const k of keys) {
-        if (k === "text") vals.push(ctx.evtText.trim());
-        else vals.push(String(a[k] ?? ""));
-      }
+      for (const k of keys) vals.push(k === "text" ? ctx.evtText.trim() : String(a[k] ?? ""));
       wr.emitEvt(idx, vals);
     }
 
@@ -277,7 +257,6 @@ export async function repackDatalinkToApx_stream(
         } catch (e: any) {
           logToFile(ctx, `[repack][warn] JSO parse failed <${ctx.capJsoName}>: ${e?.message ?? e}`);
         }
-
         ctx.capJsoActive = false;
         ctx.capJsoDepth = 0;
         ctx.capJsoName = "";
@@ -288,7 +267,7 @@ export async function repackDatalinkToApx_stream(
     ctx.stack.pop();
   });
 
-  const stream = fs.createReadStream(inputFile, { encoding: "utf8", highWaterMark: 100*1024 });
+  const stream = fs.createReadStream(inputFile, { encoding: "utf8", highWaterMark: 100 * 1024 });
   await new Promise<void>((resolve, reject) => {
     stream.on("error", reject);
     parser.on("error", reject);
@@ -299,8 +278,10 @@ export async function repackDatalinkToApx_stream(
   if (ctx.writer) {
     await ctx.writer.finalizeToFile();
   } else {
-    const wr = new ApxTlmWriter(0x0100, utcOffset, ctx.baseTs >>> 0, outFile);
+    const baseTs = fileMtimeMs(inputFile);
+    const wr = new ApxTlmWriter(1, utcOffsetSec, baseTs, outFile);
     wr.writeHeaderPlaceholder();
+    wr.emitInfo(buildInfoForInput(inputFile, "datalink", baseTs, {}, utcOffsetSec));
     await wr.finalizeToFile();
   }
 

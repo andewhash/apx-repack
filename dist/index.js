@@ -1760,30 +1760,93 @@ var ExtId;
     ExtId[ExtId["raw"] = 10] = "raw";
     ExtId[ExtId["zip"] = 11] = "zip";
 })(ExtId || (exports.ExtId = ExtId = {}));
+// ----- helpers -----
 function cstr(s) {
-    return Buffer.concat([Buffer.from(s, 'utf8'), Buffer.from([0x00])]);
+    return Buffer.concat([Buffer.from(s, "utf8"), Buffer.from([0x00])]);
 }
-function dspecByte(dspec, vidx) {
-    const low3 = vidx & 0x07;
-    const hi = (vidx >> 3) & 0xFF;
-    const b0 = (low3 << 5) | (dspec & 0x0F);
-    const b1 = hi;
-    return [b0, b1];
-}
+/** APX "qCompress" payload: [len_be(4)] + deflate(data) */
 function qCompress(payload) {
     const comp = zlib.deflateSync(payload);
     const out = Buffer.allocUnsafe(4 + comp.length);
-    out.writeUInt32BE(payload.length, 0);
+    out.writeUInt32BE(payload.length >>> 0, 0);
     comp.copy(out, 4);
     return out;
 }
+// half-float encode/decode helpers
+function f32ToF16Bits(val) {
+    const f32 = new Float32Array(1);
+    const u32 = new Uint32Array(f32.buffer);
+    f32[0] = val;
+    const x = u32[0];
+    const sign = (x >>> 31) & 0x1;
+    const exp = (x >>> 23) & 0xff;
+    const mant = x & 0x7fffff;
+    if (exp === 0xff) { // Inf/NaN
+        const isNaN = mant !== 0;
+        return (sign << 15) | (0x1f << 10) | (isNaN ? 0x200 : 0);
+    }
+    let exp16 = exp - 127 + 15;
+    if (exp <= 112) { // subnormal or zero
+        if (exp < 103)
+            return (sign << 15);
+        const shift = 113 - exp;
+        let mant16 = (0x800000 | mant) >>> shift;
+        if ((mant16 & 0x1) && ((mant & ((1 << (shift - 1)) - 1)) !== 0))
+            mant16++;
+        return (sign << 15) | mant16;
+    }
+    else if (exp16 >= 0x1f) {
+        return (sign << 15) | (0x1f << 10);
+    }
+    else {
+        let mant16 = mant >>> 13;
+        const roundBit = (mant >>> 12) & 1;
+        if (roundBit && ((mant16 & 1) || (mant & 0xFFF)))
+            mant16++;
+        if (mant16 === 0x400) {
+            mant16 = 0;
+            exp16++;
+            if (exp16 >= 0x1f)
+                return (sign << 15) | (0x1f << 10);
+        }
+        return (sign << 15) | ((exp16 & 0x1f) << 10) | (mant16 & 0x3ff);
+    }
+}
+function f16ToF32Approx(bits) {
+    const s = (bits & 0x8000) ? -1 : 1;
+    const e = (bits >>> 10) & 0x1f;
+    const f = bits & 0x3ff;
+    if (e === 0)
+        return s * Math.pow(2, -14) * (f / 1024);
+    if (e === 31)
+        return f ? NaN : s * Infinity;
+    return s * Math.pow(2, e - 15) * (1 + f / 1024);
+}
+/** choose f16 when exactly reversible (within strict equality), else f32 */
+function chooseFloatSpec(val) {
+    if (Number.isFinite(val)) {
+        const h = f32ToF16Bits(val);
+        const back = f16ToF32Approx(h);
+        if (Object.is(back, val)) {
+            return { dspec: DSpec.f16, writer: (b, off) => b.writeUInt16LE(h, off), size: 2 };
+        }
+    }
+    return { dspec: DSpec.f32, writer: (b, off) => b.writeFloatLE(val, off), size: 4 };
+}
+// ----- writer -----
 class ApxTlmWriter {
-    constructor(version = 0x0100, utcOffset = 0, startTimestampMs64 = 0, outFilePath, outStream) {
+    constructor(version = 1, // version 1 for repack
+    utcOffsetSeconds = 0, // seconds
+    startTimestampMs64 = 0, // ms epoch
+    outFilePath, outStream) {
         this.version = version;
-        this.utcOffset = utcOffset;
+        this.utcOffsetSeconds = utcOffsetSeconds;
         this.startTimestampMs64 = startTimestampMs64;
         this.declaredFields = 0;
         this.headerWritten = false;
+        this.lastWidx = -1;
+        this.lastDown = new Map();
+        this.lastUp = new Map();
         if (outStream) {
             this.ws = outStream;
         }
@@ -1803,16 +1866,21 @@ class ApxTlmWriter {
         if (this.headerWritten)
             return;
         const b = Buffer.alloc(44, 0);
-        b.write("APXTLM", 0, "ascii"); // magic
-        b.writeUInt16LE(1, 16); // версия файла 1
-        b.writeUInt16LE(44, 18); // payload_offset
-        b.writeBigUInt64LE(BigInt(this.startTimestampMs64 >>> 0), 32); // timestamp
-        b.writeInt32LE(this.utcOffset | 0, 40); // utc_offset
+        b.write("APXTLM", 0, "ascii");
+        b.writeUInt16LE(this.version & 0xFFFF, 16);
+        b.writeUInt16LE(44, 18);
+        b.writeBigUInt64LE(BigInt(this.startTimestampMs64), 32);
+        b.writeInt32LE(this.utcOffsetSeconds | 0, 40);
         this.write(b);
         this.headerWritten = true;
     }
-    // Now, let's handle the `info` section.
+    // ----- info -----
     emitInfo(info) {
+        if (typeof info === "object" && info) {
+            info.utc_offset = this.utcOffsetSeconds | 0;
+            if (info.timestamp == null)
+                info.timestamp = this.startTimestampMs64 >>> 0;
+        }
         this.pushExt(ExtId.jso);
         const nameLit = this.cachedLit("info");
         const payload = Buffer.from(JSON.stringify(info), "utf8");
@@ -1821,6 +1889,7 @@ class ApxTlmWriter {
         sz.writeUInt32LE(q.length, 0);
         this.write(Buffer.concat([nameLit, sz, q]));
     }
+    // ----- registry -----
     emitField(name, info = []) {
         this.pushExt(ExtId.field);
         const parts = [cstr(name), Buffer.from([info.length & 0xFF])];
@@ -1836,26 +1905,53 @@ class ApxTlmWriter {
             parts.push(cstr(k));
         this.write(Buffer.concat(parts));
     }
+    // ----- timestamp -----
     emitTs(ms) {
         this.pushExt(ExtId.ts);
         const b = Buffer.allocUnsafe(4);
         b.writeUInt32LE(ms >>> 0, 0);
         this.write(b);
+        this.lastWidx = -1;
     }
-    emitValueF32(fieldIndex, v) {
+    // ----- values (optimized) -----
+    writeIndexAndSpec(dspec, fieldIndex) {
+        if (this.lastWidx >= 0) {
+            const delta = fieldIndex - this.lastWidx - 1;
+            if (delta >= 0 && delta <= 7) {
+                const b0 = 0x10 | ((delta & 0x07) << 5) | (dspec & 0x0F); // opt8
+                this.write(Buffer.from([b0]));
+                this.lastWidx = fieldIndex;
+                return;
+            }
+        }
+        const low3 = fieldIndex & 0x07;
+        const hi = (fieldIndex >> 3) & 0xFF;
+        const b0 = (low3 << 5) | (dspec & 0x0F);
+        const b1 = hi;
+        this.write(Buffer.from([b0, b1]));
+        this.lastWidx = fieldIndex;
+    }
+    /** write numeric value with change filtering and best packing */
+    emitNumber(fieldIndex, v, uplink = false) {
         if (!(fieldIndex >= 0 && fieldIndex < this.declaredFields))
             return;
-        const [b0, b1] = dspecByte(DSpec.f32, fieldIndex);
-        const b = Buffer.allocUnsafe(6);
-        b[0] = b0;
-        b[1] = b1;
-        b.writeFloatLE(v, 2);
+        const cache = uplink ? this.lastUp : this.lastDown;
+        const prev = cache.get(fieldIndex);
+        if (prev !== undefined && Object.is(prev, v))
+            return;
+        cache.set(fieldIndex, v);
+        if (uplink)
+            this.pushExt(ExtId.dir);
+        const { dspec, writer, size } = chooseFloatSpec(v);
+        this.writeIndexAndSpec(dspec, fieldIndex);
+        const b = Buffer.allocUnsafe(size);
+        writer(b, 0);
         this.write(b);
     }
-    emitUplinkValueF32(fieldIndex, v) {
-        this.pushExt(ExtId.dir);
-        this.emitValueF32(fieldIndex, v);
-    }
+    // legacy API
+    emitValueF32(fieldIndex, v) { this.emitNumber(fieldIndex, v, false); }
+    emitUplinkValueF32(fieldIndex, v) { this.emitNumber(fieldIndex, v, true); }
+    // ----- strings/events/objects -----
     cachedLit(s) {
         return Buffer.concat([Buffer.from([0xFF]), cstr(s)]);
     }
@@ -1877,14 +1973,39 @@ class ApxTlmWriter {
         sz.writeUInt32LE(q.length, 0);
         this.write(Buffer.concat([nameLit, sz, q]));
     }
+    /** choose RAW or ZIP automatically (ZIP if smaller) */
     emitRaw(name, data, ts) {
         if (typeof ts === "number")
             this.emitTs(ts >>> 0);
-        this.pushExt(ExtId.raw);
         const nameLit = this.cachedLit(name);
-        const sz = Buffer.allocUnsafe(2);
-        sz.writeUInt16LE(data.length, 0);
-        this.write(Buffer.concat([nameLit, sz, data]));
+        const comp = zlib.deflateSync(data);
+        const zipped = Buffer.concat([Buffer.alloc(4), comp]);
+        zipped.writeUInt32BE(data.length >>> 0, 0); // qCompress header
+        const useZip = zipped.length < data.length + 2;
+        if (useZip) {
+            this.pushExt(ExtId.zip);
+            const sz = Buffer.allocUnsafe(4);
+            sz.writeUInt32LE(zipped.length, 0);
+            this.write(Buffer.concat([nameLit, sz, zipped]));
+        }
+        else {
+            this.pushExt(ExtId.raw);
+            if (data.length > 0xFFFF) {
+                let off = 0;
+                while (off < data.length) {
+                    const chunk = data.subarray(off, Math.min(off + 0xFFFF, data.length));
+                    const sz = Buffer.allocUnsafe(2);
+                    sz.writeUInt16LE(chunk.length, 0);
+                    this.write(Buffer.concat([nameLit, sz, chunk]));
+                    off += chunk.length;
+                }
+            }
+            else {
+                const sz = Buffer.allocUnsafe(2);
+                sz.writeUInt16LE(data.length, 0);
+                this.write(Buffer.concat([nameLit, sz, data]));
+            }
+        }
     }
     finalizeToFile() {
         this.write(Buffer.from([0x00])); // ExtId.stop
@@ -1949,10 +2070,32 @@ const path = __importStar(__nccwpck_require__(928));
 const sax_1 = __importDefault(__nccwpck_require__(560));
 const fast_xml_parser_1 = __nccwpck_require__(591);
 const apxtlm_writer_service_1 = __nccwpck_require__(650);
+const info_util_1 = __nccwpck_require__(735);
 const MAX_FIELDS = 2048;
 const TELEMETRY_TAGS = new Set(["S", "D"]);
 const EVENT_TAGS = new Set(["event", "evt"]);
 const SKIP_TOP_LEVEL = new Set(["S", "D", "event", "evt", "#text", "@_"]);
+const EPOCH_2000_MS = Date.UTC(2000, 0, 1);
+function fileMtimeMs(p) {
+    try {
+        return Math.floor(fs.statSync(p).mtimeMs);
+    }
+    catch {
+        return Date.now();
+    }
+}
+/** normalize potential seconds→ms; reject pre-2000 values (fallback to file mtime) */
+function normalizeEpochMs(n, inputFile) {
+    if (!Number.isFinite(n))
+        return fileMtimeMs(inputFile);
+    let v = n;
+    if (v < 1e12 && v >= 1e9)
+        v = v * 1000; // seconds → ms
+    v = Math.floor(v);
+    if (v < EPOCH_2000_MS)
+        return fileMtimeMs(inputFile);
+    return v;
+}
 function declareFieldsIfNeeded(ctx, tokenCountHint) {
     if (ctx.fieldsDeclared)
         return;
@@ -1960,13 +2103,12 @@ function declareFieldsIfNeeded(ctx, tokenCountHint) {
         return;
     if (!ctx.fields.length) {
         const n = Math.min(tokenCountHint ?? 0, MAX_FIELDS);
-        ctx.fields = Array.from({ length: n }, (_, i) => `.#${i}`.slice(1));
+        ctx.fields = Array.from({ length: n }, (_, i) => `#${i}`);
     }
     if (ctx.fields.length > MAX_FIELDS)
         ctx.fields.length = MAX_FIELDS;
-    for (const f of ctx.fields) {
+    for (const f of ctx.fields)
         ctx.writer.emitField(f, []);
-    }
     ctx.fieldsDeclared = true;
 }
 function declareEventIfNeeded(ctx, name, keys) {
@@ -1985,21 +2127,20 @@ function openTagToString(name, attrs) {
     const a = Object.entries(attrs ?? {}).map(([k, v]) => `${k}="${String(v)}"`).join(" ");
     return a.length ? `<${name} ${a}>` : `<${name}>`;
 }
-function closeTagToString(name) {
-    return `</${name}>`;
-}
+function closeTagToString(name) { return `</${name}>`; }
 function logToFile(ctx, message) {
     if (!ctx.logFile) {
-        ctx.logFile = fs.createWriteStream(path.resolve(__dirname, 'log.txt'), { flags: 'a' });
+        ctx.logFile = fs.createWriteStream(path.resolve(__dirname, "log.txt"), { flags: "a" });
     }
     ctx.logFile.write(`[${new Date().toISOString()}] ${message}\n`);
 }
 async function repackDatalinkToApx_stream(inputFile, outFile, opts = {}) {
     const { utcOffset = 0, includeJso = true } = opts;
+    const utcOffsetSec = utcOffset | 0;
     const ctx = {
         writer: undefined,
         wroteHeader: false,
-        utcOffset,
+        utcOffsetSec,
         baseTs: 0,
         fields: [],
         fieldsDeclared: false,
@@ -2025,44 +2166,20 @@ async function repackDatalinkToApx_stream(inputFile, outFile, opts = {}) {
         const attrs = tag.attributes;
         ctx.stack.push(name);
         if (ctx.stack.length === 1) {
-            const t = attrs?.["time_ms"] ?? attrs?.["UTC"];
-            if (t != null) {
-                const n = Number(t);
-                if (Number.isFinite(n)) {
-                    ctx.baseTs = n >>> 0;
-                }
-                else {
-                    logToFile(ctx, `Invalid timestamp detected, setting default: ${t}`);
-                    ctx.baseTs = 0;
-                }
+            const tRaw = (attrs?.["time_ms"] ?? attrs?.["UTC"]);
+            if (tRaw != null) {
+                const n = Number(tRaw);
+                ctx.baseTs = normalizeEpochMs(n, inputFile);
+            }
+            else {
+                ctx.baseTs = fileMtimeMs(inputFile);
             }
             if (!ctx.writer) {
-                ctx.writer = new apxtlm_writer_service_1.ApxTlmWriter(0x0100, ctx.utcOffset, ctx.baseTs >>> 0, outFile);
+                ctx.writer = new apxtlm_writer_service_1.ApxTlmWriter(1, ctx.utcOffsetSec, ctx.baseTs, outFile);
                 ctx.writer.writeHeaderPlaceholder();
                 ctx.wroteHeader = true;
-                const timestamp = new Date(ctx.baseTs);
-                const utcOffsetInMinutes = ctx.utcOffset / 60;
-                const info = {
-                    conf: "Borey-801",
-                    host: {
-                        hostname: "Ovsannikovs-MacBook-Pro",
-                        uid: "86C97FFC9CD3544D0D7B61F984B621B48430910F",
-                        username: "nikolay"
-                    },
-                    sw: {
-                        hash: "fe7bd27c",
-                        version: "11.2.12"
-                    },
-                    title: "250910_1730_32396E3-BOREY",
-                    unit: {
-                        name: "BOREY",
-                        time: timestamp.getTime(),
-                        type: "UAV",
-                        uid: "230047000F51323032343731"
-                    },
-                    timestamp: timestamp.getTime(), // Unix timestamp в миллисекундах
-                    utc_offset: utcOffsetInMinutes, // Смещение в минутах
-                };
+                // info первым блоком
+                const info = (0, info_util_1.buildInfoForInput)(inputFile, "datalink", ctx.baseTs, {}, ctx.utcOffsetSec);
                 ctx.writer.emitInfo(info);
             }
         }
@@ -2088,24 +2205,21 @@ async function repackDatalinkToApx_stream(inputFile, outFile, opts = {}) {
             ctx.capXml.push(openTagToString(name, attrs));
             return;
         }
-        if (ctx.capJsoActive) {
+        if (ctx.capJsoActive)
             ctx.capXml.push(openTagToString(name, attrs));
-        }
     });
     parser.on("text", (txt) => {
         if (ctx.stack.length >= 2 && ctx.stack[ctx.stack.length - 1] === "fields" && ctx.stack.includes("mandala")) {
             const raw = (txt ?? "").trim();
-            if (raw) {
+            if (raw)
                 ctx.fields = raw.split(/[,\s;]+/).map(s => s.trim()).filter(Boolean);
-            }
         }
         if (ctx.inCsv)
             ctx.csvText += txt;
         if (ctx.inEvt)
             ctx.evtText += txt;
-        if (ctx.capJsoActive && txt) {
+        if (ctx.capJsoActive && txt)
             ctx.capXml.push(txt);
-        }
     });
     parser.on("closetag", (name) => {
         if (ctx.inCsv && name === ctx.csvTag) {
@@ -2117,19 +2231,13 @@ async function repackDatalinkToApx_stream(inputFile, outFile, opts = {}) {
             const wr = ctx.writer;
             wr.emitTs((Number.isFinite(ts) ? ts : 0) >>> 0);
             const lim = Math.min(parts.length, ctx.fields.length || MAX_FIELDS);
-            let any = false;
             for (let i = 0; i < lim; i++) {
                 const s = parts[i];
-                if (s !== "") {
-                    const n = Number(s);
-                    if (Number.isFinite(n)) {
-                        wr.emitValueF32(i, n);
-                        any = true;
-                    }
-                }
-            }
-            if (!any && (ctx.fields.length || MAX_FIELDS) > 0) {
-                wr.emitValueF32(0, Number.NaN);
+                if (s === "")
+                    continue;
+                const n = Number(s);
+                if (Number.isFinite(n))
+                    wr.emitNumber(i, n, false);
             }
         }
         if (ctx.inEvt && EVENT_TAGS.has(name)) {
@@ -2145,12 +2253,8 @@ async function repackDatalinkToApx_stream(inputFile, outFile, opts = {}) {
             wr.emitTs(ts >>> 0);
             const idx = ctx.evtIndex.get(evName);
             const vals = [];
-            for (const k of keys) {
-                if (k === "text")
-                    vals.push(ctx.evtText.trim());
-                else
-                    vals.push(String(a[k] ?? ""));
-            }
+            for (const k of keys)
+                vals.push(k === "text" ? ctx.evtText.trim() : String(a[k] ?? ""));
             wr.emitEvt(idx, vals);
         }
         if (ctx.capJsoActive) {
@@ -2193,8 +2297,10 @@ async function repackDatalinkToApx_stream(inputFile, outFile, opts = {}) {
         await ctx.writer.finalizeToFile();
     }
     else {
-        const wr = new apxtlm_writer_service_1.ApxTlmWriter(0x0100, utcOffset, ctx.baseTs >>> 0, outFile);
+        const baseTs = fileMtimeMs(inputFile);
+        const wr = new apxtlm_writer_service_1.ApxTlmWriter(1, utcOffsetSec, baseTs, outFile);
         wr.writeHeaderPlaceholder();
+        wr.emitInfo((0, info_util_1.buildInfoForInput)(inputFile, "datalink", baseTs, {}, utcOffsetSec));
         await wr.finalizeToFile();
     }
     try {
@@ -2202,6 +2308,97 @@ async function repackDatalinkToApx_stream(inputFile, outFile, opts = {}) {
         logToFile(ctx, `[repack] DONE → ${path.resolve(outFile)} size=${sz} bytes`);
     }
     catch { }
+}
+
+
+/***/ }),
+
+/***/ 735:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.md5File = md5File;
+exports.md5FileSync = md5FileSync;
+exports.buildInfoForInput = buildInfoForInput;
+const fs = __importStar(__nccwpck_require__(896));
+const path = __importStar(__nccwpck_require__(928));
+const crypto_1 = __nccwpck_require__(982);
+/** async md5 of a file */
+function md5File(filePath) {
+    return new Promise((resolve, reject) => {
+        const h = (0, crypto_1.createHash)("md5");
+        const s = fs.createReadStream(filePath);
+        s.on("data", (c) => h.update(c));
+        s.on("error", reject);
+        s.on("end", () => resolve(h.digest("hex")));
+    });
+}
+function md5FileSync(filePath) {
+    const h = (0, crypto_1.createHash)("md5");
+    const b = fs.readFileSync(filePath);
+    h.update(b);
+    return h.digest("hex");
+}
+/**
+ * Build minimal 'info' block used by ground for naming and meta.
+ * utcOffsetSeconds must be in seconds and matches APXTLM header.
+ */
+function buildInfoForInput(inputFile, kind, baseTsMs, { conf = undefined, unitName = undefined, unitType = "UAV", unitUid = undefined, } = {}, utcOffsetSeconds = 0) {
+    const name = path.basename(inputFile);
+    const title = path.parse(inputFile).name;
+    const info = {
+        conf,
+        sw: undefined,
+        host: undefined,
+        title,
+        unit: (unitName || unitUid)
+            ? { name: unitName, time: baseTsMs >>> 0, type: unitType, uid: unitUid }
+            : undefined,
+        import: {
+            name,
+            title,
+            format: kind,
+            timestamp: baseTsMs,
+        },
+        timestamp: baseTsMs >>> 0,
+        utc_offset: utcOffsetSeconds | 0,
+    };
+    return info;
 }
 
 
@@ -2255,7 +2452,17 @@ const path = __importStar(__nccwpck_require__(928));
 const sax_1 = __importDefault(__nccwpck_require__(560));
 const fast_xml_parser_1 = __nccwpck_require__(591);
 const apxtlm_writer_service_1 = __nccwpck_require__(650);
+const info_util_1 = __nccwpck_require__(735);
 const MAX_FIELDS = 2048;
+const EPOCH_2000_MS = Date.UTC(2000, 0, 1);
+function fileMtimeMs(p) {
+    try {
+        return Math.floor(fs.statSync(p).mtimeMs);
+    }
+    catch {
+        return Date.now();
+    }
+}
 function ensureWriter(ctx) {
     if (!ctx.writer)
         throw new Error("Writer not initialized yet");
@@ -2291,11 +2498,10 @@ function openTagToString(name, attrs) {
     const a = Object.entries(attrs ?? {}).map(([k, v]) => `${k}="${String(v)}"`).join(" ");
     return a.length ? `<${name} ${a}>` : `<${name}>`;
 }
-function closeTagToString(name) {
-    return `</${name}>`;
-}
+function closeTagToString(name) { return `</${name}>`; }
 async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
     const { utcOffset = 0, includeJso = true } = opts;
+    const utcOffsetSec = utcOffset | 0;
     const ctx = {
         inTelemetry: false,
         inData: false,
@@ -2312,7 +2518,7 @@ async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
         writer: undefined,
         wroteHeader: false,
         baseTs: 0,
-        utcOffset,
+        utcOffsetSec,
         inDataDepth: 0,
         capJsoActive: false,
         capJsoDepth: 0,
@@ -2339,20 +2545,25 @@ async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
             if (attrs && attrs["time"] != null) {
                 const t = Number(attrs["time"]);
                 if (Number.isFinite(t))
-                    ctx.baseTs = t >>> 0;
+                    ctx.baseTs = Math.floor(t);
             }
         }
         if (name === "timestamp" && attrs && attrs["value"]) {
             const t = Date.parse(String(attrs["value"]));
             if (Number.isFinite(t))
-                ctx.baseTs = t >>> 0;
+                ctx.baseTs = Math.floor(t);
         }
         if (name === "data") {
             ctx.inData = true;
             ctx.inDataDepth = 1;
+            // нормализуем baseTs или берём mtime файла
+            if (!(ctx.baseTs >= EPOCH_2000_MS))
+                ctx.baseTs = fileMtimeMs(inputFile);
             if (!ctx.wroteHeader) {
-                ctx.writer = new apxtlm_writer_service_1.ApxTlmWriter(0x0100, ctx.utcOffset, ctx.baseTs >>> 0, outFile);
+                ctx.writer = new apxtlm_writer_service_1.ApxTlmWriter(1, ctx.utcOffsetSec, ctx.baseTs, outFile);
                 ctx.writer.writeHeaderPlaceholder();
+                // info самым первым
+                ctx.writer.emitInfo((0, info_util_1.buildInfoForInput)(inputFile, "telemetry", ctx.baseTs, {}, ctx.utcOffsetSec));
                 ctx.wroteHeader = true;
             }
             return;
@@ -2387,9 +2598,8 @@ async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
     parser.on("text", (txt) => {
         if (ctx.inFields) {
             const raw = (txt ?? "").trim();
-            if (raw) {
+            if (raw)
                 ctx.fields = raw.split(",").map(s => s.trim()).filter(Boolean);
-            }
         }
         if (ctx.inD)
             ctx.currentD_text += txt;
@@ -2411,19 +2621,13 @@ async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
             wr.emitTs(ctx.currentD_ts >>> 0);
             const parts = parseCsvKeepEmpty(ctx.currentD_text);
             const lim = Math.min(parts.length, ctx.fields.length || MAX_FIELDS);
-            let any = false;
             for (let i = 0; i < lim; i++) {
                 const s = parts[i];
-                if (s !== "") {
-                    const n = Number(s);
-                    if (Number.isFinite(n)) {
-                        wr.emitValueF32(i, n);
-                        any = true;
-                    }
-                }
-            }
-            if (!any && (ctx.fields.length || MAX_FIELDS) > 0) {
-                ctx.writer.emitValueF32(0, Number.NaN);
+                if (s === "")
+                    continue;
+                const n = Number(s);
+                if (Number.isFinite(n))
+                    wr.emitNumber(i, n, false);
             }
             return;
         }
@@ -2440,12 +2644,8 @@ async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
             wr.emitTs(ts >>> 0);
             const idx = ctx.evtIndex.get(evName);
             const vals = [];
-            for (const k of keys) {
-                if (k === "text")
-                    vals.push(ctx.currentE_text.trim());
-                else
-                    vals.push(String(a[k] ?? ""));
-            }
+            for (const k of keys)
+                vals.push(k === "text" ? ctx.currentE_text.trim() : String(a[k] ?? ""));
             wr.emitEvt(idx, vals);
             return;
         }
@@ -2478,12 +2678,10 @@ async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
         }
         if (ctx.inData)
             ctx.inDataDepth--;
-        if (name.toLowerCase() === "telemetry") {
+        if (name.toLowerCase() === "telemetry")
             ctx.inTelemetry = false;
-        }
-        if (name === "data") {
+        if (name === "data")
             ctx.inData = false;
-        }
     });
     // ===== errors / finish =====
     const stream = fs.createReadStream(inputFile, { encoding: "utf8", highWaterMark: 100 * 1024 });
@@ -2497,8 +2695,10 @@ async function repackTelemetryToApx_stream(inputFile, outFile, opts = {}) {
         await ctx.writer.finalizeToFile();
     }
     else {
-        const wr = new apxtlm_writer_service_1.ApxTlmWriter(0x0100, utcOffset, ctx.baseTs >>> 0, outFile);
+        const baseTs = fileMtimeMs(inputFile);
+        const wr = new apxtlm_writer_service_1.ApxTlmWriter(1, utcOffsetSec, baseTs, outFile);
         wr.writeHeaderPlaceholder();
+        wr.emitInfo((0, info_util_1.buildInfoForInput)(inputFile, "telemetry", baseTs, {}, utcOffsetSec));
         await wr.finalizeToFile();
     }
     try {
@@ -2599,6 +2799,14 @@ function sniffXmlKind(filePath) {
     }
 }
 
+
+/***/ }),
+
+/***/ 982:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("crypto");
 
 /***/ }),
 
